@@ -1,5 +1,5 @@
 import functools
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pygame
@@ -27,13 +27,22 @@ class PredatorPreyEnv(ParallelEnv):
         max_steps: int = 200,
         catch_radius: int = 1,
         render_mode: Optional[str] = None,
+        reward_mode: str = "original",
+        predator_shaping_scale: float = 0.1,
+        prey_shaping_scale: float = 0.05,
     ):
+        if reward_mode not in {"original", "shaped"}:
+            raise ValueError("reward_mode must be 'original' or 'shaped'")
+
         self.grid_size = grid_size
         self.num_predators = num_predators
         self.num_prey = num_prey
         self.max_steps = max_steps
         self.catch_radius = catch_radius
         self.render_mode = render_mode
+        self.reward_mode = reward_mode
+        self.predator_shaping_scale = predator_shaping_scale
+        self.prey_shaping_scale = prey_shaping_scale
 
         self.predator_ids = [f"predator_{i}" for i in range(num_predators)]
         self.prey_ids = [f"prey_{i}" for i in range(num_prey)]
@@ -74,7 +83,7 @@ class PredatorPreyEnv(ParallelEnv):
             dy = (p_pos[1] - agent_pos[1]) / self.grid_size
             obs_list.extend([dx, dy])
 
-        can_left = float(agent_pos[0] > 0 or self.grid_size > 0)
+        can_left = float(agent_pos[0] > 0)
         can_right = float(agent_pos[0] < self.grid_size - 1)
         can_up = float(agent_pos[1] > 0)
         can_down = float(agent_pos[1] < self.grid_size - 1)
@@ -87,9 +96,9 @@ class PredatorPreyEnv(ParallelEnv):
             return pos.copy()
         x, y = pos
         if action == 1:
-            y = min(y + 1, self.grid_size - 1)
-        elif action == 2:
             y = max(y - 1, 0)
+        elif action == 2:
+            y = min(y + 1, self.grid_size - 1)
         elif action == 3:
             x = max(x - 1, 0)
         elif action == 4:
@@ -148,6 +157,14 @@ class PredatorPreyEnv(ParallelEnv):
             caught[prey_id] = predators_on_prey >= 2
         return caught
 
+    def _nearest_predator_distance(self, prey_id: str) -> int:
+        prey_idx = self.agent_name_to_idx[prey_id]
+        prey_pos = self._pos[prey_idx]
+        return min(
+            int(np.abs(self._pos[self.agent_name_to_idx[pred_id]] - prey_pos).sum())
+            for pred_id in self.predator_ids
+        )
+
     def step(self, actions: Dict[str, int]):
         if any(self.terminations.values()) or any(self.truncations.values()):
             return (
@@ -157,6 +174,13 @@ class PredatorPreyEnv(ParallelEnv):
                 self.truncations.copy(),
                 {agent: {} for agent in self.agents},
             )
+
+        old_min_dist = None
+        if self.reward_mode == "shaped":
+            old_min_dist = {
+                prey_id: self._nearest_predator_distance(prey_id)
+                for prey_id in self.prey_ids
+            }
 
         for agent, action in actions.items():
             idx = self.agent_name_to_idx[agent]
@@ -170,8 +194,21 @@ class PredatorPreyEnv(ParallelEnv):
         for agent in self.agents:
             if agent in self.predator_ids:
                 rewards[agent] = -0.05
+            elif self.reward_mode == "shaped":
+                rewards[agent] = 0.02
             else:
                 rewards[agent] = 0.1
+
+        if self.reward_mode == "shaped" and old_min_dist is not None:
+            new_min_dist = {
+                prey_id: self._nearest_predator_distance(prey_id)
+                for prey_id in self.prey_ids
+            }
+            for prey_id in self.prey_ids:
+                delta = old_min_dist[prey_id] - new_min_dist[prey_id]
+                for pred_id in self.predator_ids:
+                    rewards[pred_id] += self.predator_shaping_scale * delta
+                rewards[prey_id] -= self.prey_shaping_scale * delta
 
         for prey_id, is_caught in caught.items():
             if is_caught:
@@ -239,10 +276,6 @@ class PredatorPreyEnv(ParallelEnv):
             pygame.draw.circle(self._screen, (150, 20, 20), (cx, cy), r, 2)
 
         if self.render_mode == "human":
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    return None
             pygame.display.flip()
             if self._clock:
                 self._clock.tick(30)
@@ -256,6 +289,5 @@ class PredatorPreyEnv(ParallelEnv):
 
     def close(self):
         if self._screen is not None:
-            pygame.quit()
             self._screen = None
             self._clock = None
